@@ -1,0 +1,203 @@
+GSP636 – Implement Regional Internal Proxy NLB
+Seven copy-paste blocks for Cloud Shell (the last one is optional). Open Cloud Shell in the lab console, then paste each block in order. Click Check my progress where a block tells you to before moving on.
+Paste each block into the same Cloud Shell tab. Block 1 saves your session's values to ~/lab.env, and every later block reloads them, so if Cloud Shell disconnects you can just keep going with the next block.
+The traps in this lab (why people fail it)
+The backend service must be named my-int-tcp-lb. The lab builds the load balancer in the console, where the load balancer name becomes the backend service name. The checker (and the lab's own get-health my-int-tcp-lb command) looks for that exact name. Build it with gcloud under any other name and Task 4 fails.
+The proxy-only subnet is mandatory. Without proxy-only-subnet (purpose Regional Managed Proxy) the load balancer can't be created at all.
+Backends need all three network tags (allow-ssh, allow-health-check, allow-proxy-only-subnet) on the instance template. Miss one and the matching firewall rule doesn't apply, so health checks or proxied traffic get dropped and the backends stay UNHEALTHY.
+Named port tcp80 → 80 on both MIGs. The backend service connects through the named port. Without it, there's no port to send traffic to.
+Everything regional must be in the same region, and mig-c must be in a different zone from mig-a.
+Patience. curl: (56) Connection reset by peer just means the backends aren't healthy yet. Wait for HEALTHY before testing.
+
+Block 1 – Set up your session values
+Look at the lab panel on the left of the lab page and type the Region and Zone it shows between the quotes. If you leave them blank, the block tries to detect them from the lab project.
+bash
+REGION=""
+ZONE=""
+
+PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
+[ -z "$REGION" ] && REGION=$(gcloud config get-value compute/region 2>/dev/null)
+[ -z "$REGION" ] && REGION=$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items.google-compute-default-region)" 2>/dev/null)
+[ -z "$ZONE" ] && ZONE=$(gcloud config get-value compute/zone 2>/dev/null)
+[ -z "$ZONE" ] && ZONE=$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items.google-compute-default-zone)" 2>/dev/null)
+[ -z "$ZONE" ] && [ -n "$REGION" ] && ZONE=$(gcloud compute zones list --filter="region:($REGION)" --format="value(name)" | sort | head -1)
+[ -z "$REGION" ] && [ -n "$ZONE" ] && REGION=${ZONE%-*}
+# mig-c goes in a different zone of the same region (prefer the "-c" zone)
+ZONE_C=$(gcloud compute zones list --filter="region:($REGION)" --format="value(name)" | sort | grep -vx "$ZONE" | grep -- "-c$" | head -1)
+[ -z "$ZONE_C" ] && ZONE_C=$(gcloud compute zones list --filter="region:($REGION)" --format="value(name)" | sort | grep -vx "$ZONE" | head -1)
+
+cat > ~/lab.env <<EOF
+export PROJECT_ID=$PROJECT_ID
+export REGION=$REGION
+export ZONE=$ZONE
+export ZONE_C=$ZONE_C
+EOF
+echo; echo "===== YOUR LAB VALUES ====="; cat ~/lab.env
+echo "Check REGION and ZONE against the lab panel. If wrong or blank, type them at the top and paste Block 1 again."
+
+Block 2 – Task 1: network and subnets
+bash
+source ~/lab.env
+
+gcloud compute networks create lb-network --subnet-mode=custom
+
+gcloud compute networks subnets create backend-subnet \
+  --network=lb-network --region=$REGION --range=10.1.2.0/24
+
+gcloud compute networks subnets create proxy-only-subnet \
+  --network=lb-network --region=$REGION --range=10.129.0.0/23 \
+  --purpose=REGIONAL_MANAGED_PROXY --role=ACTIVE
+
+echo; echo ">>> Click Check my progress: Create the network and backends/test subnets"
+
+Block 3 – Task 2: firewall rules
+bash
+source ~/lab.env
+
+gcloud compute firewall-rules create fw-allow-ssh \
+  --network=lb-network --direction=INGRESS --action=allow \
+  --target-tags=allow-ssh --source-ranges=0.0.0.0/0 --rules=tcp:22
+
+gcloud compute firewall-rules create fw-allow-health-check \
+  --network=lb-network --direction=INGRESS --action=allow \
+  --target-tags=allow-health-check --source-ranges=130.211.0.0/22,35.191.0.0/16 --rules=tcp:80
+
+gcloud compute firewall-rules create fw-allow-proxy-only-subnet \
+  --network=lb-network --direction=INGRESS --action=allow \
+  --target-tags=allow-proxy-only-subnet --source-ranges=10.129.0.0/23 --rules=tcp:80
+
+echo; echo ">>> Click Check my progress: Create Firewall Rules"
+
+Block 4 – Task 3: instance template and backend MIGs
+Takes a few minutes. The last step checks that Apache is listening on all interfaces.
+bash
+source ~/lab.env
+
+cat > ~/startup.sh <<'EOF'
+#! /bin/bash
+apt-get update
+apt-get install apache2 -y
+a2ensite default-ssl
+a2enmod ssl
+vm_hostname="$(curl -H "Metadata-Flavor:Google" \
+http://metadata.google.internal/computeMetadata/v1/instance/name)"
+echo "Page served from: $vm_hostname" | \
+tee /var/www/html/index.html
+systemctl restart apache2
+EOF
+
+gcloud compute instance-templates create int-tcp-proxy-backend-template \
+  --region=$REGION --network=lb-network --subnet=backend-subnet \
+  --tags=allow-ssh,allow-health-check,allow-proxy-only-subnet \
+  --machine-type=e2-medium --image-family=debian-12 --image-project=debian-cloud \
+  --metadata-from-file=startup-script=$HOME/startup.sh
+
+gcloud compute instance-groups managed create mig-a \
+  --zone=$ZONE --template=int-tcp-proxy-backend-template --size=2
+gcloud compute instance-groups managed set-named-ports mig-a \
+  --zone=$ZONE --named-ports=tcp80:80
+
+gcloud compute instance-groups managed create mig-c \
+  --zone=$ZONE_C --template=int-tcp-proxy-backend-template --size=2
+gcloud compute instance-groups managed set-named-ports mig-c \
+  --zone=$ZONE_C --named-ports=tcp80:80
+
+echo; echo ">>> Click Check my progress: Create backend Managed Instance Groups (MIGs)"
+
+echo "Waiting for the startup script to install Apache (about 3 minutes)..."
+for i in $(seq 12); do
+  VM=$(gcloud compute instances list --filter="name ~ mig-a" --limit=1 --format="value(name)")
+  OUT=$(gcloud compute ssh $VM --zone=$ZONE --quiet --command="sudo ss -tlnp | grep ':80 '" 2>/dev/null)
+  [ -n "$OUT" ] && { echo "$OUT"; echo "Apache is listening on port 80 (look for 0.0.0.0:80 or *:80, NOT 127.0.0.1:80)"; break; }
+  echo "  not ready yet ($i/12), waiting 20s..."; sleep 20
+done
+
+Block 5 – Task 4: the load balancer
+bash
+source ~/lab.env
+
+gcloud compute addresses create int-tcp-ip-address \
+  --region=$REGION --subnet=backend-subnet --purpose=SHARED_LOADBALANCER_VIP
+LB_IP=$(gcloud compute addresses describe int-tcp-ip-address --region=$REGION --format="value(address)")
+echo "export LB_IP=$LB_IP" >> ~/lab.env
+echo "LB_IP_ADDRESS = $LB_IP"
+
+gcloud compute health-checks create tcp tcp-health-check --region=$REGION --port=80
+
+# Backend service name = load balancer name (this is what the checker looks for)
+gcloud compute backend-services create my-int-tcp-lb \
+  --region=$REGION --load-balancing-scheme=INTERNAL_MANAGED --protocol=TCP \
+  --port-name=tcp80 --health-checks=tcp-health-check --health-checks-region=$REGION
+
+gcloud compute backend-services add-backend my-int-tcp-lb --region=$REGION \
+  --instance-group=mig-a --instance-group-zone=$ZONE \
+  --balancing-mode=UTILIZATION --max-utilization=0.8
+gcloud compute backend-services add-backend my-int-tcp-lb --region=$REGION \
+  --instance-group=mig-c --instance-group-zone=$ZONE_C \
+  --balancing-mode=UTILIZATION --max-utilization=0.8
+
+gcloud compute target-tcp-proxies create my-int-tcp-lb-target-proxy \
+  --region=$REGION --backend-service=my-int-tcp-lb
+
+gcloud compute forwarding-rules create int-tcp-forwarding-rule \
+  --region=$REGION --load-balancing-scheme=INTERNAL_MANAGED \
+  --network=lb-network --subnet=backend-subnet --subnet-region=$REGION \
+  --address=int-tcp-ip-address --ports=110 \
+  --target-tcp-proxy=my-int-tcp-lb-target-proxy --target-tcp-proxy-region=$REGION
+
+echo; echo ">>> Click Check my progress: Configure the Load Balancer"
+
+Block 6 – Task 5: client VM and traffic test
+Waits for the backends to report HEALTHY, then sends traffic from inside the VPC.
+bash
+source ~/lab.env
+
+gcloud compute instances create client-vm --zone=$ZONE \
+  --network=lb-network --subnet=backend-subnet --tags=allow-ssh \
+  --machine-type=e2-small --image-family=debian-12 --image-project=debian-cloud
+
+echo "Waiting for backends to become HEALTHY (can take 5-10 minutes)..."
+for i in $(seq 30); do
+  H=$(gcloud compute backend-services get-health my-int-tcp-lb --region=$REGION --format="value(status.healthStatus[].healthState)" | tr ';' '\n' | grep -c "^HEALTHY$")
+  echo "  $H instance(s) healthy ($i/30)"
+  [ "$H" -ge 2 ] && break
+  sleep 20
+done
+gcloud compute backend-services get-health my-int-tcp-lb --region=$REGION \
+  --format="table(status.healthStatus[].instance.basename(),status.healthStatus[].healthState)"
+
+echo; echo "Sending 10 requests from client-vm to $LB_IP:110 (hostnames should alternate):"
+for i in $(seq 6); do
+  OUT=$(gcloud compute ssh client-vm --zone=$ZONE --quiet \
+    --command="for n in \$(seq 10); do curl -s --max-time 5 $LB_IP:110; done" 2>/dev/null)
+  [ -n "$OUT" ] && { echo "$OUT"; break; }
+  echo "  client-vm not ready yet ($i/6), waiting 20s..."; sleep 20
+done
+
+echo; echo ">>> Click Check my progress: Test the load balancer"
+
+Block 7 – (Optional) Task 6: least-privilege client template
+bash
+source ~/lab.env
+
+gcloud compute instance-templates create int-tcp-proxy-client-template \
+  --region=$REGION --network=lb-network --subnet=backend-subnet --tags=allow-ssh \
+  --machine-type=e2-small --image-family=debian-12 --image-project=debian-cloud
+
+gcloud compute instances delete client-vm --zone=$ZONE --quiet
+gcloud compute instances create client-vm --zone=$ZONE \
+  --source-instance-template=int-tcp-proxy-client-template
+
+echo "Backend template tags (should be exactly allow-ssh, allow-health-check, allow-proxy-only-subnet):"
+gcloud compute instance-templates describe int-tcp-proxy-backend-template --format="value(properties.tags.items)"
+
+sleep 30
+gcloud compute ssh client-vm --zone=$ZONE --quiet \
+  --command="for n in \$(seq 5); do curl -s --max-time 5 $LB_IP:110; done"
+
+Troubleshooting
+"already exists" errors when re-pasting a block are harmless. The resource is already there, keep going.
+A check fails right after a block finishes: wait a minute and click again.
+Backends stay UNHEALTHY: confirm the template has all three tags (gcloud compute instance-templates describe int-tcp-proxy-backend-template --format="value(properties.tags.items)") and that fw-allow-health-check exists on lb-network. UNHEALTHY backends almost always mean a firewall or tag problem.
+curl: (56) Connection reset by peer: the backends aren't healthy yet. Re-paste Block 6; it waits for HEALTHY first.
+Wrong region or zone: type the values from the lab panel at the top of Block 1 and paste it again. If resources were already created in the wrong region, delete them before continuing.
